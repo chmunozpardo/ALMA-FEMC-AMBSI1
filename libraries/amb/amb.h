@@ -1,12 +1,11 @@
 /*
  ****************************************************************************
- # $Id: amb.h,v 1.9 2004/11/18 19:57:56 avaccari Exp $
  #
- # Copyright (C) 1999
+ # Copyright (C) 1999-2022
  # Associated Universities, Inc. Washington DC, USA.
  #
  # Correspondence concerning ALMA should be addressed as follows:
- #        Internet email: mmaswgrp@nrao.edu
+ #        Internet email: feic_na@nrao.edu
  ****************************************************************************
  */
 /**
@@ -112,15 +111,6 @@
 	 * interrupts on the C167. 
 	 */
 	extern int amb_start();
-
-	/**
-	 * Utility functions for accessing internal counters and information 
-	 */
-
-	extern void amb_get_rev_level(ubyte	*major, ubyte *minor, ubyte *patch); /* Protocol version */
-	extern void amb_get_error_status(uword	*num_errors,		             /* Number of CAN errors */
-									 ubyte	*last_slave_error);	             /* Last internal slave error */
-	extern void amb_get_num_transactions(ulong *num_transactions);           /* Number of completed transactions */
 
 #endif /* AMB_H */
 
