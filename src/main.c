@@ -9,9 +9,13 @@
 
 //! Longest timeout allowed waiting for acknowledgement from ARCOM board
 /*! During each phase of monitoring, a count-down timer counts from \p MAX_TIMEOUT
-	down to zero unless an aknowledgment is received. */
-#define MAX_TIMEOUT 500    
-// about 530 microseconds based on 0xFFFF = 70 ms
+	down to zero unless an acknowledgment is received. */
+#define MAX_TIMEOUT 470
+// about 500 microseconds based on 0xFFFF = 70 ms
+
+//! Timeout for each byte when we are already sending or receiving a packet.
+#define EPP_BYTE_TIMEOUT 30
+// About 32 microseconds
 
 //! Is the firmware using the 48 ms pulse?
 /*! Defines if the 48ms pulse is used to trigger the correponding interrupt.
@@ -44,7 +48,7 @@
 /* Version Info */
 #define VERSION_MAJOR 01	//!< Major Version
 #define VERSION_MINOR 02	//!< Minor Revision
-#define VERSION_PATCH 03	//!< Patch Level
+#define VERSION_PATCH 04	//!< Patch Level
 
 /* Uses serial port */
 #include <reg167.h>
@@ -53,6 +57,9 @@
 /* include library interface */
 #include "..\libraries\amb\amb.h"
 #include "..\libraries\ds1820\ds1820.h"
+
+/* memset, memcpy */
+#include <string.h>
 
 /* Set aside memory for the callbacks in the AMB library */
 static CALLBACK_STRUCT idata cb_memory[9];
@@ -88,9 +95,15 @@ sbit  SPPS_SELECTIN     = P2^10;  // output
 static unsigned int idata monTimer1, monTimer2, monTimer3, monTimer4, monTimer5, monTimer6, monTimer7,
                           cmdTimer1, cmdTimer2, cmdTimer3, cmdTimer4, cmdTimer5, cmdTimer6;
 
-/* Macro to implement FULL_HANDSHAKE */
+/* Macros to implement EPP handshake */
 // Wait for Data Strobe to go low
-#define IMPL_HANDSHAKE(TIMER) for(TIMER = MAX_TIMEOUT; TIMER && EPPC_NDATASTROBE; TIMER--) {}
+#define IMPL_HANDSHAKE(TIMER, TIMEOUT) { \
+    for(TIMER = MAX_TIMEOUT; TIMER && EPPC_NDATASTROBE; TIMER--) {} \
+    TIMEOUT = !TIMER; }
+
+#define EPP_BYTE_HANDSHAKE(TIMER, TIMEOUT) { \
+    for(TIMER = EPP_BYTE_TIMEOUT; TIMER && EPPC_NDATASTROBE; TIMER--) {} \
+    TIMEOUT = !TIMER; }
 
 /* Macro to toggle WAIT high then low */
 #define TOGGLE_NWAIT { EPPS_NWAIT = 1; EPPS_NWAIT = 0; }
@@ -407,7 +420,12 @@ void received_48ms(void) interrupt 0x30{
 // incoming pulse on (pin31) to the cpu (pin28).
 }
 
-
+/*! structures used in controlMsg */
+static struct {
+    unsigned long RCA;
+    unsigned char dataLen;
+    unsigned char data[8];
+} idata controlRequest;
 
 /*! This function will be called in case a CAN control message is received.
 	It will start communication with the ARCOM board triggering the parallel port
@@ -420,7 +438,7 @@ void received_48ms(void) interrupt 0x30{
 	\return	0 -	Everything went OK */
 int controlMsg(CAN_MSG_TYPE *message){
 
-	unsigned char counter;
+	unsigned char i, timeout;
 	unsigned int timer;
 
 	if(message->dirn==CAN_MONITOR){
@@ -428,36 +446,24 @@ int controlMsg(CAN_MSG_TYPE *message){
 		return 0;
 	}
 
+    // C166 is little endian, same as CAN
+	controlRequest.RCA = message -> relative_address;
+	controlRequest.dataLen = message -> len;
+	memset(&(controlRequest.data), 0, 8);
+    memcpy(&(controlRequest.data), message -> data, 8);
+
 	/* Trigger interrupt */
 	EPPS_INTERRUPT = 1;
 
-	/* Send RCA */
-    IMPL_HANDSHAKE(timer)
-	P7 = (uword) (message->relative_address);	// Put data on port
-    TOGGLE_NWAIT;
-
-    IMPL_HANDSHAKE(timer)
-    P7 = (uword) (message->relative_address>>8); 	// Put data on port
-    TOGGLE_NWAIT;
-
-    IMPL_HANDSHAKE(timer)
-	P7 = (uword) (message->relative_address>>16); 	// Put data on port
-    TOGGLE_NWAIT;
-
-    IMPL_HANDSHAKE(timer)
-	P7 = (uword) (message->relative_address>>24); 	// Put data on port
-    TOGGLE_NWAIT;
-
-	/* Send payload size */
-    IMPL_HANDSHAKE(timer)
-	P7 = message->len;
-    TOGGLE_NWAIT;
-
-	for(counter=0;counter<message->len;counter++){
-	    IMPL_HANDSHAKE(timer)
-		P7 = message->data[counter];
-        TOGGLE_NWAIT;
-	}
+	/* Send controlRequest packet */
+    IMPL_HANDSHAKE(timer, timeout);
+    if (!timeout) {
+        for (i = 0; i < sizeof(controlRequest); i++) {
+            EPP_BYTE_HANDSHAKE(timer, timeout)
+            P7 = (uword) ((unsigned char *) &controlRequest) + i;
+            TOGGLE_NWAIT;
+        }
+    }
 
 	/* Untrigger interrupt */
 	EPPS_INTERRUPT = 0;
@@ -465,65 +471,58 @@ int controlMsg(CAN_MSG_TYPE *message){
 	return 0;
 }
 
+/*! structures used in implMonitorSingle */
+static struct {
+    unsigned long RCA;
+    unsigned char dataLen;
+} idata monitorRequest;
 
-/*! Implementation of one monitor transaction.  
+static struct {
+    unsigned char dataLen;
+    unsigned char data[8];
+} idata monitorResponse;
+
+/*! Implementation of one monitor transaction.
     Abstracted out so that monitorMsg below can retry
-    
-    \param  *message    a CAN_MSG_TYPE 
+
+    \param  *message    a CAN_MSG_TYPE
     \param  sendReply   TRUE to send CAN replies.  FALSE to suppress them for messages sent in getSetupInfo().
     \return
         - 0 -> Everything went OK
         - -1 -> Time out during CAN message forwarding */
+
 int implMonitorSingle(CAN_MSG_TYPE *message, unsigned char sendReply) {
-    unsigned char counter, timeout;
+    unsigned char i, timeout;
+
+    // C166 is little endian, same as CAN
+    monitorRequest.RCA = message -> relative_address;
+    monitorRequest.dataLen = 0;
 
     /* Trigger interrupt */
     EPPS_INTERRUPT = 1;
 
-    /* Send RCA */
-    IMPL_HANDSHAKE(monTimer1)
-    P7 = (uword) (message->relative_address);   // Put data on port
-    TOGGLE_NWAIT;
-
-    IMPL_HANDSHAKE(monTimer2)
-    P7 = (uword) (message->relative_address>>8);    // Put data on port
-    TOGGLE_NWAIT;
-
-    IMPL_HANDSHAKE(monTimer3)
-    P7 = (uword) (message->relative_address>>16);   // Put data on port
-    TOGGLE_NWAIT;
-
-    IMPL_HANDSHAKE(monTimer4)
-    P7 = (uword) (message->relative_address>>24);   // Put data on port
-    TOGGLE_NWAIT;
-
-    /* Send payload size (0 -> monitor message) */
-    IMPL_HANDSHAKE(monTimer5)
-    P7 = message->len;  // Put data on port (0 -> monitor message)
-    TOGGLE_NWAIT;
-
-    /* Set port to receive data */
-    DP7 = 0x00;
-    _nop_();
-    _nop_();
-
-    /* Receive monitor payload size */
-    IMPL_HANDSHAKE(monTimer6)
-    message->len = (ubyte) P7;  // Read data from port
-    TOGGLE_NWAIT;
-
-    /* Detect timeout or error receiving payload size */
-    timeout = 0;
-    if (!monTimer6 || message->len > MAX_CAN_MSG_PAYLOAD) {
-        timeout = 1;
-    }
-
+    /* Send monitorRequest packet */
+    IMPL_HANDSHAKE(monTimer1, timeout);
     if (!timeout) {
-        /* Get the payload */
-        for(counter = 0; counter < message->len; counter++) {
-            IMPL_HANDSHAKE(monTimer7)
-            message->data[counter] = (ubyte) P7;    // Read data from port
+        for (i = 0; i < sizeof(monitorRequest); i++) {
+            EPP_BYTE_HANDSHAKE(monTimer2, timeout)
+            P7 = (uword) ((unsigned char *) &monitorRequest) + i;
             TOGGLE_NWAIT;
+        }
+
+        /* Set port to receive data */
+        DP7 = 0x00;
+        _nop_();
+        _nop_();
+
+        /* Receive response */
+        IMPL_HANDSHAKE(monTimer3, timeout);
+        if (!timeout) {
+            for (i = 0; i < sizeof(monitorResponse); i++) {
+                EPP_BYTE_HANDSHAKE(monTimer4, timeout)
+                *((unsigned char *) &monitorResponse) = (ubyte) P7;
+                TOGGLE_NWAIT;
+            }
         }
     }
 
@@ -533,6 +532,11 @@ int implMonitorSingle(CAN_MSG_TYPE *message, unsigned char sendReply) {
     _nop_();
     /* Untrigger interrupt */
     EPPS_INTERRUPT = 0;
+
+    if (!timeout) {
+        message -> len = monitorResponse.dataLen;
+        memcpy(message -> data, &(monitorResponse.data), 8);
+    }
 
     /* Handle timeout or reply suppressed */
     if (timeout || !sendReply) {
