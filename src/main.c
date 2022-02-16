@@ -1,19 +1,17 @@
 /*!	\file	main.c
 	\brief	AMBSI1 firmware code for the FEMC module
 
-	This is the firmware to be loaded into the AMBSI1 to allow the AMBSI1 to work as a
-	bridge between the CAN bus contained in the AMB and the ARCOM embedded controller
-	handling the front end hardware.
+    This is the firmware to be loaded into the AMBSI1 to allow the AMBSI1 to work as a
+    bridge between the CAN bus and the ARCOM embedded controller handling the front end hardware.
+    All CAN messages are forwarded to the ARCOM over GPIO pins on JP7 set up as an ISA parallel port.
 */
 /* Defines */
 
-//! Longest timeout allowed waiting for acknowledgement from ARCOM board
-/*! During each phase of monitoring, a count-down timer counts from \p MAX_TIMEOUT
-	down to zero unless an acknowledgment is received. */
-#define MAX_TIMEOUT 470
+//! Timeout waiting for EPP ready when sending or receiving bytes
+#define EPP_START_TIMEOUT 470
 // about 500 microseconds based on 0xFFFF = 70 ms
 
-//! Timeout for each byte when we are already sending or receiving a packet.
+//! Timeout for each byte when we are already sending or receiving
 #define EPP_BYTE_TIMEOUT 30
 // About 32 microseconds
 
@@ -33,36 +31,50 @@
     requests available in the firmware. */
 
 #define BASE_SPECIAL_MONITOR_RCA    0x20000L
-#define GET_AMBSI1_VERSION_INFO     0x20000L    //!< Get the firmware version of this firmware.
+#define GET_AMBSI1_VERSION_INFO     0x20000L    //!< Get the version of this firmware.
 #define GET_SETUP_INFO              0x20001L    //!< In versions 1.0.0 and 1.0.1 a monitor request to this initiates communication between the AMBSI1 and the ARCOM.
-                                                //!< In version 1.2.x communication is established automatically at power-up.  This request still sends a reply for compatibility with ALMA and FETMS software.
-#define GET_ARCOM_VERSION_INFO      0x20002L	//!< Get the ARCOM Pegasus firware version.
-#define GET_SPECIAL_MONITOR_RCAS    0x20003L	//!< Get the special monitor RCA range from ARCOM. DEPRECATED
-#define GET_SPECIAL_CONTROL_RCAS    0x20004L	//!< Get the special control RCA range from ARCOM. DEPRECATED
-#define GET_MONITOR_RCAS            0x20005L	//!< Get the standard monitor RCA range from the ARCOM firmware.
-#define GET_CONTROL_RCAS            0x20006L	//!< Get the standard control RCA range from the ARCOM firmware.
+                                                //!< Since version 1.2.x communication is established automatically at power-up.
+                                                //!< This request still sends a reply for compatibility with ALMA and FETMS software.
+#define GET_ARCOM_VERSION_INFO      0x20002L    //!< Get the ARCOM Pegasus firmware version.
+#define GET_SPECIAL_MONITOR_RCAS    0x20003L    //!< Get the special monitor RCA range from ARCOM.
+                                                //!< DEPRECATED in the FE ICD but still used by this app to set up ISR callbacks
+#define GET_SPECIAL_CONTROL_RCAS    0x20004L    //!< Get the special control RCA range from ARCOM.
+                                                //!< DEPRECATED in the FE ICD but still used by this app to set up ISR callbacks
+#define GET_MONITOR_RCAS            0x20005L    //!< Get the standard monitor RCA range from the ARCOM firmware.
+                                                //!< DEPRECATED in the FE ICD but still used by this app to set up ISR callbacks
+#define GET_CONTROL_RCAS            0x20006L    //!< Get the standard control RCA range from the ARCOM firmware.
+                                                //!< DEPRECATED in the FE ICD but still used by this app to set up ISR callbacks
 #define GET_LO_PA_LIMITS_TABLE_ESN  0x20010L    //!< 0x20010 through 0x20019 return the PA LIMITS table ESNs.
-#define GET_MON_TIMERS1_RCA         0x20020L    //!< Get monitor timing countdown registers 1-4.
-#define GET_MON_TIMERS2_RCA         0x20021L    //!< Get monitor timing countdown registers 5-8.
+
+// We carve out some of the special monitor RCAs for timers and debugging of this firmware:
+#define BASE_AMBSI1_RESERVED        0x20020L    //!< Lowest special RCA served by this firmware not forwarded to ARCOM.
+#define GET_MON_TIMERS_RCA          0x20020L    //!< Get monitor timing countdown registers 1-4.
+#define GET_MON_TIMERS2_RCA         0x20021L    //!< DEPRECATED
+#define GET_CMD_TIMERS_RCA          0x20022L    //!< Get command timing countdown registers 1 & 2, EPP_START_TIMEOUT, EPP_BYTE_TIMEOUT
+#define GET_PPORT_STATE             0x20023L    //!< Get the state of the parallel port lines and other state info
+#define LAST_AMBSI1_RESERVED        0x2003FL    //!< Highest special RCA served by this firmware not forwarded to ARCOM.
 
 /* Version Info */
 #define VERSION_MAJOR 01	//!< Major Version
-#define VERSION_MINOR 02	//!< Minor Revision
-#define VERSION_PATCH 04	//!< Patch Level
+#define VERSION_MINOR 04	//!< Minor Revision
+#define VERSION_PATCH 05	//!< Patch Level
 
-/* Uses serial port */
+/* Uses GPIO ports */
 #include <reg167.h>
 #include <intrins.h>
 
-/* include library interface */
+/* include library interfaces */
 #include "..\libraries\amb\amb.h"
 #include "..\libraries\ds1820\ds1820.h"
 
 /* memset, memcpy */
 #include <string.h>
 
-/* Set aside memory for the callbacks in the AMB library */
-static CALLBACK_STRUCT idata cb_memory[9];
+/* Set aside memory for the callbacks in the AMB library
+   This is larger than the number of handlers because some handlers get registered for more than one range.
+   There should be a slot here for each call to amb_register_function() in this program.
+   This being too small caused a buffer overflow in 1.2.0 and before! */
+static CALLBACK_STRUCT idata cb_memory[8];
 
 /* CAN message callbacks */
 int ambient_msg(CAN_MSG_TYPE *message); 	//!< Called to get the board temperature temperature
@@ -70,10 +82,9 @@ int controlMsg(CAN_MSG_TYPE *message);  	//!< Called to handle CAN control messa
 int monitorMsg(CAN_MSG_TYPE *message);  	//!< Called to handle CAN monitor messages 
 int getSetupInfo(CAN_MSG_TYPE *message);  	//!< Called to get the AMBSI1 <-> ARCOM link/setup information 
 int getVersionInfo(CAN_MSG_TYPE *message);	//!< Called to get firmware version informations 
-int getMonTimers1(CAN_MSG_TYPE *message);    //!< Retrieve last monitor message timers
-int getMonTimers2(CAN_MSG_TYPE *message);    //!< Retrieve last monitor message timers
+int getReservedMsg(CAN_MSG_TYPE *message);  //!< Monitor timers and debugging info from this firmware
 
-/* implementation helpers */
+/* implementation helper */
 int implMonitorSingle(CAN_MSG_TYPE *message, unsigned char sendReply);
 
 /* A global for the last read temperature */
@@ -92,18 +103,17 @@ sbit  EPPS_NWAIT        = P2^8;   // output
 sbit  SPPS_SELECTIN     = P2^10;  // output
 
 /* Separate timers for each phase of monitor and control transaction */
-static unsigned int idata monTimer1, monTimer2, monTimer3, monTimer4, monTimer5, monTimer6, monTimer7,
-                          cmdTimer1, cmdTimer2, cmdTimer3, cmdTimer4, cmdTimer5, cmdTimer6;
+static unsigned int idata monTimer1, monTimer2, monTimer3, monTimer4, cmdTimer1, cmdTimer2;
 
 /* Macros to implement EPP handshake */
-// Wait for Data Strobe to go low
-#define IMPL_HANDSHAKE(TIMER, TIMEOUT) { \
-    for(TIMER = MAX_TIMEOUT; TIMER && EPPC_NDATASTROBE; TIMER--) {} \
+// Wait for Data Strobe to go low and detect timeout
+#define EPP_START_HANDSHAKE(TIMER, TIMEOUT) { \
+    for(TIMER = EPP_START_TIMEOUT; TIMER && EPPC_NDATASTROBE; TIMER--) {} \
     TIMEOUT = !TIMER; }
 
-#define EPP_BYTE_HANDSHAKE(TIMER, TIMEOUT) { \
-    for(TIMER = EPP_BYTE_TIMEOUT; TIMER && EPPC_NDATASTROBE; TIMER--) {} \
-    TIMEOUT = !TIMER; }
+// Wait for Data Strobe to go low
+#define EPP_BYTE_HANDSHAKE(TIMER) { \
+    for(TIMER = EPP_BYTE_TIMEOUT; TIMER && EPPC_NDATASTROBE; TIMER--) {}}
 
 /* Macro to toggle WAIT high then low */
 #define TOGGLE_NWAIT { EPPS_NWAIT = 1; EPPS_NWAIT = 0; }
@@ -123,7 +133,7 @@ static bit idata initialized;	// have the RCAs been initialized?
 
 //! MAIN
 /*! Takes care of initializing the AMBSI1, the CAN subrutine and globally enables interrupts.
-    version 1.2.0: also performs AMBSI1 to ARCOM link setup. */ 
+    Since version 1.2.0: also performs AMBSI1 to ARCOM link setup. */
 void main(void) {
     unsigned long timer;
 
@@ -144,11 +154,11 @@ void main(void) {
 	if (amb_init_slave((void *) cb_memory) != 0) 
 		return;
 
-	/* Register callbacks for CAN events */
+	/* Register callback for ambient temperature */
 	if (amb_register_function(0x30003, 0x30003, ambient_msg) != 0)
 		return;
 
-	/* Register callbacks for CAN version information event (RCA -> 0x20000) */
+	/* Register callback for firmware version */
 	if (amb_register_function(GET_AMBSI1_VERSION_INFO, GET_AMBSI1_VERSION_INFO, getVersionInfo) != 0)
 		return;
 
@@ -159,15 +169,12 @@ void main(void) {
 	SPPS_SELECTIN=1;
 	DP2=0x0580; 
 
-	/* Register callbacks for CAN events (RCA -> 0x20001) */
+	/* Register callback for the special setup message */
 	if (amb_register_function(GET_SETUP_INFO, GET_SETUP_INFO, getSetupInfo) != 0)
 		return;
 
-    /* Register callbacks for monitor timers (RCA -> 0x20010, 0x20011) */
-    if (amb_register_function(GET_MON_TIMERS1_RCA, GET_MON_TIMERS1_RCA, getMonTimers1) != 0)
-        return;
-
-    if (amb_register_function(GET_MON_TIMERS2_RCA, GET_MON_TIMERS2_RCA, getMonTimers2) != 0)
+    /* Register callback for timers and debugging messages */
+    if (amb_register_function(BASE_AMBSI1_RESERVED, LAST_AMBSI1_RESERVED, getReservedMsg) != 0)
         return;
 
 	/* globally enable interrupts */
@@ -212,36 +219,6 @@ int getVersionInfo(CAN_MSG_TYPE *message){
 	message->data[2]=VERSION_PATCH;
 	message->len=3;
 	return 0;
-}
-
-
-/*! return the timers for phases 1 through 4 of the last monitor request handled. */
-int getMonTimers1(CAN_MSG_TYPE *message) {
-    message->data[1] = (unsigned char) (monTimer1);
-    message->data[0] = (unsigned char) (monTimer1 >> 8);
-    message->data[3] = (unsigned char) (monTimer2);
-    message->data[2] = (unsigned char) (monTimer2 >> 8);
-    message->data[5] = (unsigned char) (monTimer3);
-    message->data[4] = (unsigned char) (monTimer3 >> 8);
-    message->data[7] = (unsigned char) (monTimer4);
-    message->data[6] = (unsigned char) (monTimer4 >> 8);
-    message->len=8;
-    return 0;
-}
-
-/*! return the timers for phases 5, 6, 7 of the last monitor request handled.
-    the fourth byte is the starting countdown value MAX_TIMEOUT */
-int getMonTimers2(CAN_MSG_TYPE *message) {
-    message->data[1] = (unsigned char) (monTimer5);
-    message->data[0] = (unsigned char) (monTimer5 >> 8);
-    message->data[3] = (unsigned char) (monTimer6);
-    message->data[2] = (unsigned char) (monTimer6 >> 8);
-    message->data[5] = (unsigned char) (monTimer7);
-    message->data[4] = (unsigned char) (monTimer7 >> 8);
-    message->data[7] = (unsigned char) (MAX_TIMEOUT);
-    message->data[6] = (unsigned char) (MAX_TIMEOUT >> 8);
-    message->len=8;
-    return 0;
 }
 
 /*! This function get the RCAs info from the ARCOM board and register the appropriate CAN functions.
@@ -299,7 +276,7 @@ int getSetupInfo(CAN_MSG_TYPE *message){
 	lowestSpecialMonitorRCA += ((unsigned long)myCANMessage.data[2])<<16;
 	lowestSpecialMonitorRCA += ((unsigned long)myCANMessage.data[1])<<8;
 	lowestSpecialMonitorRCA += ((unsigned long)myCANMessage.data[0]);
-	/* Register callbacks for special messages */
+	/* Register callback for special messages */
 	amb_register_function(lowestSpecialMonitorRCA, highestSpecialMonitorRCA, monitorMsg);
 
 
@@ -325,7 +302,7 @@ int getSetupInfo(CAN_MSG_TYPE *message){
 	lowestSpecialControlRCA += ((unsigned long)myCANMessage.data[2])<<16;
 	lowestSpecialControlRCA += ((unsigned long)myCANMessage.data[1])<<8;
 	lowestSpecialControlRCA += ((unsigned long)myCANMessage.data[0]);
-	/* Register callbacks for special control RCA messages */
+	/* Register callback for special control RCA messages */
 	amb_register_function(lowestSpecialControlRCA, highestSpecialControlRCA, controlMsg);
 
 
@@ -352,7 +329,7 @@ int getSetupInfo(CAN_MSG_TYPE *message){
 	lowestMonitorRCA += ((unsigned long)myCANMessage.data[2])<<16;
 	lowestMonitorRCA += ((unsigned long)myCANMessage.data[1])<<8;
 	lowestMonitorRCA += ((unsigned long)myCANMessage.data[0]);
-	/* Register callbacks for special messages */
+	/* Register callback for special messages */
 	amb_register_function(lowestMonitorRCA, highestMonitorRCA, monitorMsg);
 
 
@@ -380,7 +357,7 @@ int getSetupInfo(CAN_MSG_TYPE *message){
 	lowestControlRCA += ((unsigned long)myCANMessage.data[2])<<16;
 	lowestControlRCA += ((unsigned long)myCANMessage.data[1])<<8;
 	lowestControlRCA += ((unsigned long)myCANMessage.data[0]);
-	/* Register callbacks for special messages */
+	/* Register callback for special messages */
 	amb_register_function(lowestControlRCA, highestControlRCA, controlMsg);
 
 
@@ -391,7 +368,60 @@ int getSetupInfo(CAN_MSG_TYPE *message){
     return 0;
 }
 
-
+//! handle all the special monitor messages reserved for the AMBSI1 firmware.
+//! These are to aid debugging
+int getReservedMsg(CAN_MSG_TYPE *message) {
+    switch(message -> relative_address) {
+        case GET_MON_TIMERS_RCA:
+            /*! return the timers for phases 1 through 4 of the last monitor request handled. */
+            message -> data[0] = (unsigned char) (monTimer1 >> 8);
+            message -> data[1] = (unsigned char) (monTimer1);
+            message -> data[2] = (unsigned char) (monTimer2 >> 8);
+            message -> data[3] = (unsigned char) (monTimer2);
+            message -> data[4] = (unsigned char) (monTimer3 >> 8);
+            message -> data[5] = (unsigned char) (monTimer3);
+            message -> data[6] = (unsigned char) (monTimer4 >> 8);
+            message -> data[7] = (unsigned char) (monTimer4);
+            message -> len = 8;
+            break;
+        case GET_CMD_TIMERS_RCA:
+            /*! return the timers for phases 1 through 4 of the last command handled. */
+            message -> data[0] = (unsigned char) (cmdTimer1 >> 8);
+            message -> data[1] = (unsigned char) (cmdTimer1);
+            message -> data[2] = (unsigned char) (cmdTimer2 >> 8);
+            message -> data[3] = (unsigned char) (cmdTimer2);
+            message -> data[4] = (unsigned char) (EPP_START_TIMEOUT >> 8);
+            message -> data[5] = (unsigned char) (EPP_START_TIMEOUT);
+            message -> data[6] = (unsigned char) (EPP_BYTE_TIMEOUT >> 8);
+            message -> data[7] = (unsigned char) (EPP_BYTE_TIMEOUT);
+            message -> len = 8;
+            break;
+        case GET_PPORT_STATE:
+            // Return the parallel port control and status lines.
+            message -> data[0] = (unsigned char) SPPC_NSELECT;
+            message -> data[1] = (unsigned char) SPPS_SELECTIN;
+            message -> data[2] = (unsigned char) SPPC_INIT;
+            message -> data[3] = (unsigned char) EPPS_INTERRUPT;
+            message -> data[4] = (unsigned char) DP7;
+            message -> data[5] = (unsigned char) P7;
+            message -> data[6] = (unsigned char) ready;
+            message -> data[7] = (unsigned char) initialized;
+            message -> len = 8;
+            break;
+        default:
+            message -> data[0] = (unsigned char) 0;
+            message -> data[1] = (unsigned char) 0;
+            message -> data[2] = (unsigned char) 0;
+            message -> data[3] = (unsigned char) 0;
+            message -> data[4] = (unsigned char) 0;
+            message -> data[5] = (unsigned char) 0;
+            message -> data[6] = (unsigned char) 0;
+            message -> data[7] = (unsigned char) 0;
+            message -> len = 0;
+            break;
+    }
+    return 0;
+}
 
 /*! Return the temperature of the AMBSI as measured by the DS1820 onboard chip.
 
@@ -406,11 +436,8 @@ int ambient_msg(CAN_MSG_TYPE *message) {
 		message->data[2] = ambient_temp_data[2];
 		message->data[3] = ambient_temp_data[3];
 	} 
-
 	return 0;
 }
-
-
 
 /* Triggers every 48ms pulse */
 void received_48ms(void) interrupt 0x30{
@@ -422,10 +449,12 @@ void received_48ms(void) interrupt 0x30{
 
 /*! structures used in controlMsg */
 static struct {
-    unsigned long RCA;
+    unsigned char RCA[4];
     unsigned char dataLen;
     unsigned char data[8];
 } idata controlRequest;
+
+static unsigned char * idata pControlRequest = (unsigned char *) &controlRequest;
 
 /*! This function will be called in case a CAN control message is received.
 	It will start communication with the ARCOM board triggering the parallel port
@@ -439,28 +468,29 @@ static struct {
 int controlMsg(CAN_MSG_TYPE *message){
 
 	unsigned char i, timeout;
-	unsigned int timer;
 
 	if(message->dirn==CAN_MONITOR){
 		monitorMsg(message);
 		return 0;
 	}
 
-    // C166 is little endian, same as CAN
-	controlRequest.RCA = message -> relative_address;
+    controlRequest.RCA[0] = (ubyte) (message -> relative_address);
+    controlRequest.RCA[1] = (ubyte) (message -> relative_address >> 8);
+    controlRequest.RCA[2] = (ubyte) (message -> relative_address >> 16);
+    controlRequest.RCA[3] = (ubyte) (message -> relative_address >> 24);
 	controlRequest.dataLen = message -> len;
-	memset(&(controlRequest.data), 0, 8);
-    memcpy(&(controlRequest.data), message -> data, 8);
+    memset(&(controlRequest.data), 0, 8);
+    memcpy(&(controlRequest.data), message -> data, message -> len);
 
 	/* Trigger interrupt */
 	EPPS_INTERRUPT = 1;
 
 	/* Send controlRequest packet */
-    IMPL_HANDSHAKE(timer, timeout);
+    EPP_START_HANDSHAKE(cmdTimer1, timeout);
     if (!timeout) {
         for (i = 0; i < sizeof(controlRequest); i++) {
-            EPP_BYTE_HANDSHAKE(timer, timeout)
-            P7 = (uword) ((unsigned char *) &controlRequest) + i;
+            EPP_BYTE_HANDSHAKE(cmdTimer2)
+            P7 = *(pControlRequest + i);
             TOGGLE_NWAIT;
         }
     }
@@ -473,14 +503,18 @@ int controlMsg(CAN_MSG_TYPE *message){
 
 /*! structures used in implMonitorSingle */
 static struct {
-    unsigned long RCA;
+    unsigned char RCA[4];
     unsigned char dataLen;
 } idata monitorRequest;
+
+static unsigned char * idata pMonitorRequest = (unsigned char *) &monitorRequest;
 
 static struct {
     unsigned char dataLen;
     unsigned char data[8];
 } idata monitorResponse;
+
+static unsigned char * idata pMonitorResponse = (unsigned char *) &monitorResponse;
 
 /*! Implementation of one monitor transaction.
     Abstracted out so that monitorMsg below can retry
@@ -494,19 +528,21 @@ static struct {
 int implMonitorSingle(CAN_MSG_TYPE *message, unsigned char sendReply) {
     unsigned char i, timeout;
 
-    // C166 is little endian, same as CAN
-    monitorRequest.RCA = message -> relative_address;
+    monitorRequest.RCA[0] = (ubyte) (message -> relative_address);
+    monitorRequest.RCA[1] = (ubyte) (message -> relative_address >> 8);
+    monitorRequest.RCA[2] = (ubyte) (message -> relative_address >> 16);
+    monitorRequest.RCA[3] = (ubyte) (message -> relative_address >> 24);
     monitorRequest.dataLen = 0;
 
     /* Trigger interrupt */
     EPPS_INTERRUPT = 1;
 
     /* Send monitorRequest packet */
-    IMPL_HANDSHAKE(monTimer1, timeout);
+    EPP_START_HANDSHAKE(monTimer1, timeout);
     if (!timeout) {
         for (i = 0; i < sizeof(monitorRequest); i++) {
-            EPP_BYTE_HANDSHAKE(monTimer2, timeout)
-            P7 = (uword) ((unsigned char *) &monitorRequest) + i;
+            EPP_BYTE_HANDSHAKE(monTimer2)
+            P7 = *(pMonitorRequest + i);
             TOGGLE_NWAIT;
         }
 
@@ -516,11 +552,11 @@ int implMonitorSingle(CAN_MSG_TYPE *message, unsigned char sendReply) {
         _nop_();
 
         /* Receive response */
-        IMPL_HANDSHAKE(monTimer3, timeout);
+        EPP_START_HANDSHAKE(monTimer3, timeout);
         if (!timeout) {
             for (i = 0; i < sizeof(monitorResponse); i++) {
-                EPP_BYTE_HANDSHAKE(monTimer4, timeout)
-                *((unsigned char *) &monitorResponse) = (ubyte) P7;
+                EPP_BYTE_HANDSHAKE(monTimer4)
+                *(pMonitorResponse + i) = (unsigned char) P7;
                 TOGGLE_NWAIT;
             }
         }
