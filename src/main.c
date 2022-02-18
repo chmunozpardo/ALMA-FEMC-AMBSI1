@@ -7,14 +7,6 @@
 */
 /* Defines */
 
-//! Timeout waiting for EPP ready when sending or receiving bytes
-#define EPP_START_TIMEOUT 470
-// about 500 microseconds based on 0xFFFF = 70 ms
-
-//! Timeout for each byte when we are already sending or receiving
-#define EPP_BYTE_TIMEOUT 30
-// About 32 microseconds
-
 //! Is the firmware using the 48 ms pulse?
 /*! Defines if the 48ms pulse is used to trigger the correponding interrupt.
 	If yes then P8.0 will not be available for use as a normal I/O pin since
@@ -48,9 +40,8 @@
 
 // We carve out some of the special monitor RCAs for timers and debugging of this firmware:
 #define BASE_AMBSI1_RESERVED        0x20020L    //!< Lowest special RCA served by this firmware not forwarded to ARCOM.
-#define GET_MON_TIMERS_RCA          0x20020L    //!< Get monitor timing countdown registers 1-4.
+#define GET_TIMERS_RCA              0x20020L    //!< Get monitor and command timing countdown registers.
 #define GET_MON_TIMERS2_RCA         0x20021L    //!< DEPRECATED
-#define GET_CMD_TIMERS_RCA          0x20022L    //!< Get command timing countdown registers 1 & 2, EPP_START_TIMEOUT, EPP_BYTE_TIMEOUT
 #define GET_PPORT_STATE             0x20023L    //!< Get the state of the parallel port lines and other state info
 #define LAST_AMBSI1_RESERVED        0x2003FL    //!< Highest special RCA served by this firmware not forwarded to ARCOM.
 
@@ -103,17 +94,18 @@ sbit  EPPS_NWAIT        = P2^8;   // output
 sbit  SPPS_SELECTIN     = P2^10;  // output
 
 /* Separate timers for each phase of monitor and control transaction */
-static unsigned int idata monTimer1, monTimer2, monTimer3, monTimer4, cmdTimer1, cmdTimer2;
+static unsigned int idata monTimer1, monTimer2, cmdTimer;
 
 /* Macros to implement EPP handshake */
-// Wait for Data Strobe to go low and detect timeout
-#define EPP_START_HANDSHAKE(TIMER, TIMEOUT) { \
-    for(TIMER = EPP_START_TIMEOUT; TIMER && EPPC_NDATASTROBE; TIMER--) {} \
-    TIMEOUT = !TIMER; }
 
-// Wait for Data Strobe to go low
-#define EPP_BYTE_HANDSHAKE(TIMER) { \
-    for(TIMER = EPP_BYTE_TIMEOUT; TIMER && EPPC_NDATASTROBE; TIMER--) {}}
+//! Timeout waiting for EPP ready when sending or receiving bytes
+#define EPP_MAX_TIMEOUT 470
+// about 500 microseconds based on 0xFFFF = 70 ms
+
+//! Wait for Data Strobe to go low and detect timeout
+#define EPP_HANDSHAKE(TIMER, TIMEOUT) { \
+    for(TIMER = EPP_MAX_TIMEOUT; TIMER && EPPC_NDATASTROBE; TIMER--) {} \
+    TIMEOUT = !TIMER; }
 
 /* Macro to toggle WAIT high then low */
 #define TOGGLE_NWAIT { EPPS_NWAIT = 1; EPPS_NWAIT = 0; }
@@ -372,28 +364,16 @@ int getSetupInfo(CAN_MSG_TYPE *message){
 //! These are to aid debugging
 int getReservedMsg(CAN_MSG_TYPE *message) {
     switch(message -> relative_address) {
-        case GET_MON_TIMERS_RCA:
+        case GET_TIMERS_RCA:
             /*! return the timers for phases 1 through 4 of the last monitor request handled. */
             message -> data[0] = (unsigned char) (monTimer1 >> 8);
             message -> data[1] = (unsigned char) (monTimer1);
             message -> data[2] = (unsigned char) (monTimer2 >> 8);
             message -> data[3] = (unsigned char) (monTimer2);
-            message -> data[4] = (unsigned char) (monTimer3 >> 8);
-            message -> data[5] = (unsigned char) (monTimer3);
-            message -> data[6] = (unsigned char) (monTimer4 >> 8);
-            message -> data[7] = (unsigned char) (monTimer4);
-            message -> len = 8;
-            break;
-        case GET_CMD_TIMERS_RCA:
-            /*! return the timers for phases 1 through 4 of the last command handled. */
-            message -> data[0] = (unsigned char) (cmdTimer1 >> 8);
-            message -> data[1] = (unsigned char) (cmdTimer1);
-            message -> data[2] = (unsigned char) (cmdTimer2 >> 8);
-            message -> data[3] = (unsigned char) (cmdTimer2);
-            message -> data[4] = (unsigned char) (EPP_START_TIMEOUT >> 8);
-            message -> data[5] = (unsigned char) (EPP_START_TIMEOUT);
-            message -> data[6] = (unsigned char) (EPP_BYTE_TIMEOUT >> 8);
-            message -> data[7] = (unsigned char) (EPP_BYTE_TIMEOUT);
+            message -> data[4] = (unsigned char) (cmdTimer >> 8);
+            message -> data[5] = (unsigned char) (cmdTimer);
+            message -> data[6] = (unsigned char) (EPP_MAX_TIMEOUT >> 8);
+            message -> data[7] = (unsigned char) (EPP_MAX_TIMEOUT);
             message -> len = 8;
             break;
         case GET_PPORT_STATE:
@@ -486,13 +466,11 @@ int controlMsg(CAN_MSG_TYPE *message){
 	EPPS_INTERRUPT = 1;
 
 	/* Send controlRequest packet */
-    EPP_START_HANDSHAKE(cmdTimer1, timeout);
-    if (!timeout) {
-        for (i = 0; i < sizeof(controlRequest); i++) {
-            EPP_BYTE_HANDSHAKE(cmdTimer2)
-            P7 = *(pControlRequest + i);
-            TOGGLE_NWAIT;
-        }
+	timeout = 0;
+    for (i = 0; !timeout && i < sizeof(controlRequest); i++) {
+        EPP_HANDSHAKE(cmdTimer, timeout)
+        P7 = *(pControlRequest + i);
+        TOGGLE_NWAIT;
     }
 
 	/* Untrigger interrupt */
@@ -538,37 +516,35 @@ int implMonitorSingle(CAN_MSG_TYPE *message, unsigned char sendReply) {
     EPPS_INTERRUPT = 1;
 
     /* Send monitorRequest packet */
-    EPP_START_HANDSHAKE(monTimer1, timeout);
-    if (!timeout) {
-        for (i = 0; i < sizeof(monitorRequest); i++) {
-            EPP_BYTE_HANDSHAKE(monTimer2)
-            P7 = *(pMonitorRequest + i);
-            TOGGLE_NWAIT;
-        }
+    timeout = 0;
+    for (i = 0; !timeout && i < sizeof(monitorRequest); i++) {
+        EPP_HANDSHAKE(monTimer1, timeout)
+        P7 = *(pMonitorRequest + i);
+        TOGGLE_NWAIT;
+    }
 
-        /* Set port to receive data */
-        DP7 = 0x00;
-        _nop_();
-        _nop_();
+    /* Set port to receive data */
+    DP7 = 0x00;
+    _nop_();
+    _nop_();
 
-        /* Receive response */
-        EPP_START_HANDSHAKE(monTimer3, timeout);
-        if (!timeout) {
-            for (i = 0; i < sizeof(monitorResponse); i++) {
-                EPP_BYTE_HANDSHAKE(monTimer4)
-                *(pMonitorResponse + i) = (unsigned char) P7;
-                TOGGLE_NWAIT;
-            }
-        }
+    /* Receive response */
+    timeout = 0;
+    for (i = 0; !timeout && i < sizeof(monitorResponse); i++) {
+        EPP_HANDSHAKE(monTimer2, timeout)
+        *(pMonitorResponse + i) = (unsigned char) P7;
+        TOGGLE_NWAIT;
     }
 
     //Set port to transmit data:
     DP7 = 0xFF;
     _nop_();
     _nop_();
+
     /* Untrigger interrupt */
     EPPS_INTERRUPT = 0;
 
+    // Get the response data:
     if (!timeout) {
         message -> len = monitorResponse.dataLen;
         memcpy(message -> data, &(monitorResponse.data), 8);
