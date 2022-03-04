@@ -48,7 +48,7 @@
 /* Version Info */
 #define VERSION_MAJOR 01	//!< Major Version
 #define VERSION_MINOR 04	//!< Minor Revision
-#define VERSION_PATCH 05	//!< Patch Level
+#define VERSION_PATCH 06	//!< Patch Level
 
 /* Uses GPIO ports */
 #include <reg167.h>
@@ -99,8 +99,9 @@ static unsigned int idata monTimer1, monTimer2, cmdTimer;
 /* Macros to implement EPP handshake */
 
 //! Timeout waiting for EPP ready when sending or receiving bytes
-#define EPP_MAX_TIMEOUT 470
-// about 500 microseconds based on 0xFFFF = 70 ms
+#define EPP_MAX_TIMEOUT 1000
+// about 1 millisecond based on 0xFFFF = 70 ms
+// This is intentionally much longer than it should ever take because recovery from timeouts is messy.
 
 //! Wait for Data Strobe to go low and detect timeout
 #define EPP_HANDSHAKE(TIMER, TIMEOUT) { \
@@ -523,28 +524,26 @@ int implMonitorSingle(CAN_MSG_TYPE *message, unsigned char sendReply) {
         TOGGLE_NWAIT;
     }
 
-    /* Set port to receive data */
-    DP7 = 0x00;
-    _nop_();
-    _nop_();
-
-    /* Receive response */
-    timeout = 0;
-    for (i = 0; !timeout && i < sizeof(monitorResponse); i++) {
-        EPP_HANDSHAKE(monTimer2, timeout)
-        *(pMonitorResponse + i) = (unsigned char) P7;
-        TOGGLE_NWAIT;
+    if (!timeout) {
+        /* Set port to receive data */
+        DP7 = 0x00;
+        /* Receive response */
+        for (i = 0; !timeout && i < sizeof(monitorResponse); i++) {
+            EPP_HANDSHAKE(monTimer2, timeout)
+            *(pMonitorResponse + i) = (unsigned char) P7;
+            TOGGLE_NWAIT;
+        }
+        //Set port to transmit data:
+        DP7 = 0xFF;
     }
-
-    //Set port to transmit data:
-    DP7 = 0xFF;
-    _nop_();
-    _nop_();
 
     /* Untrigger interrupt */
     EPPS_INTERRUPT = 0;
 
     // Get the response data:
+    if (monitorResponse.dataLen == 0 || monitorResponse.dataLen > 8)
+        timeout = 1;
+
     if (!timeout) {
         message -> len = monitorResponse.dataLen;
         memcpy(message -> data, &(monitorResponse.data), 8);
