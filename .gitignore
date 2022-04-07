@@ -5,3 +5,4 @@ objects
 *.uvgui.*
 *.__b
 *build_log*
+*.obj

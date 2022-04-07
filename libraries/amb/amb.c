@@ -26,13 +26,15 @@
 /* Version of SOFTWARE */
 #define SW_VERSION_MAJOR 1
 #define SW_VERSION_MINOR 3
-#define SW_VERSION_PATCH 3
+#define SW_VERSION_PATCH 4
 /* Version of HARDWARE */
 #define HW_VERSION_MAJOR 1
 #define HW_VERSION_MINOR 6
 
 /* REVISION HISTORY */
-/* Version 01.03.03 - Morgan McLeod mmcleod@nrao.edu
+/* Version 01.03.04 - Christopher Muñoz chmunozpardo@gmail.com
+                      Reduce priority of CAN ISR from 13 to 12
+ * Version 01.03.03 - Morgan McLeod mmcleod@nrao.edu
                       Separate monitor response from request handling to enable
                       message queueing in client code.
                       Async read ambient temperature

@@ -24,9 +24,9 @@
     requests available in the firmware. */
 
 #define BASE_SPECIAL_MONITOR_RCA    0x20000L
-#define GET_AMBSI1_VERSION_INFO     0x20000L    //!< Get the firmware version of this firmware.
+#define GET_AMBSI1_VERSION_INFO     0x20000L    //!< Get the version of this firmware.
 #define GET_SETUP_INFO              0x20001L    //!< In versions 1.0.0 and 1.0.1 a monitor request to this initiates communication between the AMBSI1 and the ARCOM.
-                                                //!< In version 1.2.x communication is established automatically at power-up.
+                                                //!< Since version 1.2.x communication is established automatically at power-up.
                                                 //!< This request still sends a reply for compatibility with ALMA and FETMS software.
 #define GET_ARCOM_VERSION_INFO      0x20002L	//!< Get the ARCOM Pegasus firmware version.
 #define GET_SPECIAL_MONITOR_RCAS    0x20003L	//!< Get the special monitor RCA range from ARCOM.
@@ -42,9 +42,9 @@
 // We carve out some of the special monitor RCAs for timers and debugging of this firmware:
 #define BASE_AMBSI1_RESERVED        0x20020L    //!< Lowest special RCA served by this firmware not forwarded to ARCOM.
 #define GET_MON_TIMERS1_RCA         0x20020L    //!< Get monitor timing countdown registers 1-4.
-#define GET_MON_TIMERS2_RCA         0x20021L    //!< Get monitor timing countdown registers 5-7 and the value of MAX_TIMEOUT.
+#define GET_MON_TIMERS2_RCA         0x20021L    //!< Get monitor timing countdown registers 5-7 and the value of EPP_MAX_TIMEOUT.
 #define GET_CMD_TIMERS1_RCA         0x20022L    //!< Get command timing countdown registers 1-4.
-#define GET_CMD_TIMERS2_RCA         0x20023L    //!< Get command timing countdown registers 5-6 and the value of MAX_TIMEOUT.
+#define GET_CMD_TIMERS2_RCA         0x20023L    //!< Get command timing countdown registers 5-6 and the value of EPP_MAX_TIMEOUT.
 #define GET_PPORT_STATE             0x20024L    //!< Get the state of the parallel port lines and other state info
 #define GET_QUEUE_STATE             0x20025L    //!< Get the queueWritePos, queueReadPos, and QUEUE_SIZE
 #define INSPECT_QUEUE_HEAD_RCA      0x20026L    //!< Return the RCA last written to the queue
@@ -139,15 +139,16 @@ static unsigned int idata monTimer1, monTimer2, monTimer3, monTimer4, monTimer5,
                           cmdTimer1, cmdTimer2, cmdTimer3, cmdTimer4, cmdTimer5, cmdTimer6;
 
 //! Longest timeout allowed waiting for acknowledgment from ARCOM board
-/*! During each phase of monitoring, a count-down timer counts from \p MAX_TIMEOUT
+/*! During each phase of monitoring, a count-down timer counts from EPP_MAX_TIMEOUT
     down to zero unless an acknowledgment is received. */
 
-#define MAX_TIMEOUT 500
-// about 530 microseconds based on 0xFFFF = 70 ms
+#define EPP_MAX_TIMEOUT 1000
+// about 1 millisecond based on 0xFFFF = 70 ms
+// This is intentionally much longer than it should ever take because recovery from timeouts is messy.
 
 // Macro to implement handshake with ARCOM board:
 // Wait for Data Strobe to go low
-#define IMPL_HANDSHAKE(TIMER) for (TIMER = MAX_TIMEOUT; TIMER && EPPC_NDATASTROBE; TIMER--) {}
+#define IMPL_HANDSHAKE(TIMER) for (TIMER = EPP_MAX_TIMEOUT; TIMER && EPPC_NDATASTROBE; TIMER--) {}
 
 // Macro to rapidly toggle EPPS_NWAIT:
 //   Acknowledge with Wait going high.
@@ -177,7 +178,7 @@ static bit idata ready;			// This gets set to true after GPIO ports and CAN call
 static bit idata initialized;	// This gets set to true after CAN callbacks for the ARCOM board are registered.
 
 //! MAIN
-/*! Takes care of initializing the AMBSI1, the CAN subroutine and globally enables interrupts.
+/*! Takes care of initializing the AMBSI1, the CAN library and globally enables interrupts.
     Since version 1.2.0: also performs AMBSI1 to ARCOM link setup. */
 void main(void) {
     CAN_MSG_TYPE idata *queueRead_p;
@@ -263,7 +264,7 @@ void main(void) {
     }
 
     /* Signal on the Select-In line that the AMBSI1 is ready.
-       Since version 1.3.0 this ARCOM no longer waits for this. */
+       Since ARCOM version 3.6.x, ARCOM no longer waits for this. */
     SPPS_SELECTIN = 0;
 
     /* set the count down timer for reading the ambient temperature */
@@ -346,8 +347,8 @@ int getReservedMsg(CAN_MSG_TYPE *message) {
             message -> data[3] = (unsigned char) (monTimer6);
             message -> data[4] = (unsigned char) (monTimer7 >> 8);
             message -> data[5] = (unsigned char) (monTimer7);
-            message -> data[6] = (unsigned char) (MAX_TIMEOUT >> 8);
-            message -> data[7] = (unsigned char) (MAX_TIMEOUT);
+            message -> data[6] = (unsigned char) (EPP_MAX_TIMEOUT >> 8);
+            message -> data[7] = (unsigned char) (EPP_MAX_TIMEOUT);
             message -> len = 8;
             break;
         case GET_CMD_TIMERS1_RCA:
@@ -371,8 +372,8 @@ int getReservedMsg(CAN_MSG_TYPE *message) {
             message -> data[3] = (unsigned char) (cmdTimer6);
             message -> data[5] = (unsigned char) 0;
             message -> data[4] = (unsigned char) 0;
-            message -> data[6] = (unsigned char) (MAX_TIMEOUT >> 8);
-            message -> data[7] = (unsigned char) (MAX_TIMEOUT);
+            message -> data[6] = (unsigned char) (EPP_MAX_TIMEOUT >> 8);
+            message -> data[7] = (unsigned char) (EPP_MAX_TIMEOUT);
             message -> len = 8;
             break;
         case GET_PPORT_STATE:
@@ -452,7 +453,7 @@ int getReservedMsg(CAN_MSG_TYPE *message) {
         case INSPECT_CURRENT_MON_HEAD:
             // Return the data length (uchar) and message direction (uint) from the message most recently read from the queue.
             message->data[0] = currentArcomMonitor->len;
-            message->data[1] = currentArcomMonitor->dirn;
+            message->data[1] = (unsigned char)(currentArcomMonitor->dirn);
             message->data[2] = (unsigned char)(currentArcomMonitor->relative_address);
             message->data[3] = (unsigned char)(currentArcomMonitor->relative_address >> 8);
             message->data[4] = (unsigned char)(currentArcomMonitor->relative_address >> 16);
